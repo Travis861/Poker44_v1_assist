@@ -9,60 +9,39 @@ from poker44_ml.features import chunk_features
 
 try:
     import joblib
-except ImportError:  # pragma: no cover - surfaced only in incomplete runtime envs.
+except ImportError:  # pragma: no cover
     joblib = None
 
 
 class Poker44Model:
-    """Runtime wrapper for supervised benchmark or legacy anomaly artifacts."""
+    """Small runtime wrapper for the rebuilt supervised Poker44 artifact."""
 
     def __init__(self, model_path: str | Path):
         if joblib is None:
-            raise RuntimeError(
-                "joblib is required to load the Poker44 model artifact. "
-                "Install runtime dependencies first."
-            )
-
+            raise RuntimeError("joblib is required to load Poker44 models.")
         self.model_path = Path(model_path)
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model artifact not found: {self.model_path}")
 
         artifact = joblib.load(self.model_path)
-        model_list = artifact.get("models")
-        if model_list:
-            self.models = list(model_list)
-        elif artifact.get("model") is not None:
+        self.models = list(artifact.get("models") or [])
+        if not self.models and artifact.get("model") is not None:
             self.models = [artifact["model"]]
-        else:
-            raise RuntimeError("Model artifact is missing model content.")
+        if not self.models:
+            raise RuntimeError("Model artifact contains no models.")
 
         self.feature_names = list(artifact.get("feature_names") or [])
         self.metadata = dict(artifact.get("metadata") or {})
-        self.score_quantiles = dict(self.metadata.get("score_quantiles") or {})
-        self.score_expansion = dict(self.metadata.get("score_expansion") or {})
-        self.score_remap = dict(self.metadata.get("score_remap") or {})
-        self.feature_distance_calibrator = dict(
-            self.metadata.get("feature_distance_calibrator") or {}
+        self.calibrator = artifact.get("calibrator")
+        self.human_guard = dict(self.metadata.get("human_guard") or {})
+        self.feature_distance_calibration = dict(
+            self.metadata.get("feature_distance_calibration") or {}
         )
-        self.ensemble_combiner = str(self.metadata.get("ensemble_combiner", "average"))
-        self.ensemble_max_blend = float(self.metadata.get("ensemble_max_blend", 0.75))
-        self.probability_calibrator = artifact.get("probability_calibrator")
-        self.task_type = str(
-            self.metadata.get(
-                "task_type",
-                "human-baseline" if self.score_quantiles else "supervised-benchmark",
-            )
+        self.model_weights = list(
+            artifact.get("model_weights")
+            or self.metadata.get("model_weights")
+            or [1.0 for _ in self.models]
         )
-
-    def _aligned_rows(self, chunks: list[list[dict[str, Any]]]) -> list[list[float]]:
-        rows: list[list[float]] = []
-        for chunk in chunks:
-            feats = chunk_features(chunk)
-            feats["hand_count"] = float(len(chunk))
-            if not self.feature_names:
-                self.feature_names = sorted(feats)
-            rows.append([float(feats.get(name, 0.0)) for name in self.feature_names])
-        return rows
 
     @staticmethod
     def _clamp01(value: float) -> float:
@@ -70,214 +49,204 @@ class Poker44Model:
 
     @staticmethod
     def _sigmoid(value: float) -> float:
-        if value >= 0:
-            z = math.exp(-value)
-            return 1.0 / (1.0 + z)
-        z = math.exp(value)
-        return z / (1.0 + z)
+        value = max(-40.0, min(40.0, float(value)))
+        return 1.0 / (1.0 + math.exp(-value))
 
-    def _risk_from_anomaly(self, anomaly_score: float) -> float:
-        q50 = float(self.score_quantiles.get("q50", 0.0))
-        q90 = float(self.score_quantiles.get("q90", q50 + 1.0))
-        q95 = float(self.score_quantiles.get("q95", q50 + 1.0))
-        q99 = float(self.score_quantiles.get("q99", q95 + 1.0))
-        q995 = float(self.score_quantiles.get("q995", q99 + 1.0))
-        q999 = float(self.score_quantiles.get("q999", q995 + 1.0))
-        q9995 = float(self.score_quantiles.get("q9995", q999 + 1.0))
+    def _aligned_rows(self, chunks: list[list[dict[str, Any]]]) -> list[list[float]]:
+        rows: list[list[float]] = []
+        for chunk in chunks:
+            features = chunk_features(chunk)
+            features["hand_count"] = float(len(chunk))
+            if not self.feature_names:
+                self.feature_names = sorted(features)
+            rows.append([float(features.get(name, 0.0)) for name in self.feature_names])
+        return rows
 
-        if q90 <= q50:
-            q90 = q50 + 1.0
-        if q95 <= q90:
-            q95 = q90 + 1e-6
-        if q99 <= q95:
-            q99 = q95 + 1e-6
-        if q995 <= q99:
-            q995 = q99 + 1e-6
-        if q999 <= q995:
-            q999 = q995 + 1e-6
-        if q9995 <= q999:
-            q9995 = q999 + 1e-6
-
-        if anomaly_score <= q50:
-            return 0.0
-        if anomaly_score <= q90:
-            scaled = (anomaly_score - q50) / max(q90 - q50, 1e-9)
-            return round(0.10 * self._clamp01(math.sqrt(max(0.0, scaled))), 6)
-        if anomaly_score <= q95:
-            scaled = (anomaly_score - q90) / max(q95 - q90, 1e-9)
-            return round(0.10 + 0.10 * self._clamp01(scaled), 6)
-        if anomaly_score <= q99:
-            scaled = (anomaly_score - q95) / max(q99 - q95, 1e-9)
-            return round(0.20 + 0.08 * self._clamp01(scaled), 6)
-        if anomaly_score <= q995:
-            scaled = (anomaly_score - q99) / max(q995 - q99, 1e-9)
-            return round(0.28 + 0.05 * self._clamp01(scaled), 6)
-        if anomaly_score <= q999:
-            scaled = (anomaly_score - q995) / max(q999 - q995, 1e-9)
-            return round(0.33 + 0.018 * self._clamp01(scaled), 6)
-        if anomaly_score <= q9995:
-            scaled = (anomaly_score - q999) / max(q9995 - q999, 1e-9)
-            return round(0.348 + 0.012 * self._clamp01(scaled), 6)
-        scaled = (anomaly_score - q9995) / max(q9995 - q999, 1e-9)
-        return round(0.36 + 0.64 * self._clamp01(math.sqrt(max(0.0, scaled))), 6)
-
-    def _predict_supervised_scores(self, rows: list[list[float]]) -> list[float]:
-        if not rows:
-            return []
-
-        per_model_scores: list[list[float]] = []
+    def _raw_model_scores(self, rows: list[list[float]]) -> list[float]:
+        per_model: list[list[float]] = []
         for model in self.models:
             if hasattr(model, "predict_proba"):
                 probabilities = model.predict_proba(rows)
-                per_model_scores.append([float(row[1]) for row in probabilities])
-                continue
-            if hasattr(model, "decision_function"):
+                per_model.append([self._clamp01(row[1]) for row in probabilities])
+            elif hasattr(model, "decision_function"):
                 decisions = model.decision_function(rows)
-                per_model_scores.append(
-                    [self._sigmoid(float(value)) for value in decisions]
-                )
-                continue
-            predictions = model.predict(rows)
-            per_model_scores.append([float(value) for value in predictions])
-
-        combined: list[float] = []
-        max_blend = min(max(float(self.ensemble_max_blend), 0.0), 1.0)
-        for index in range(len(rows)):
-            values = [scores[index] for scores in per_model_scores]
-            average_score = sum(values) / max(len(values), 1)
-            max_score = max(values)
-            if self.ensemble_combiner == "max":
-                score = max_score
-            elif self.ensemble_combiner == "avg_max_blend":
-                score = (1.0 - max_blend) * average_score + max_blend * max_score
+                per_model.append([self._sigmoid(value) for value in decisions])
             else:
-                score = average_score
-            combined.append(self._clamp01(score))
-        if self.probability_calibrator is not None and hasattr(
-            self.probability_calibrator, "transform"
-        ):
-            calibrated = self.probability_calibrator.transform(combined)
-            calibrated = self._apply_feature_distance_calibrator(
-                [self._clamp01(value) for value in calibrated],
-                rows,
-            )
-            return [
-                round(value, 6)
-                for value in self._apply_supervised_score_remap(
-                    calibrated
-                )
-            ]
-        if self.probability_calibrator is not None and hasattr(
-            self.probability_calibrator, "predict_proba"
-        ):
-            calibrated = self.probability_calibrator.predict_proba(
-                [[float(value)] for value in combined]
-            )
-            calibrated_scores = self._apply_feature_distance_calibrator(
-                [self._clamp01(row[1]) for row in calibrated],
-                rows,
-            )
-            return [
-                round(value, 6)
-                for value in self._apply_supervised_score_remap(
-                    calibrated_scores
-                )
-            ]
-        combined = self._apply_feature_distance_calibrator(combined, rows)
-        return [round(value, 6) for value in self._apply_supervised_score_remap(combined)]
+                per_model.append([self._clamp01(value) for value in model.predict(rows)])
 
-    def _apply_feature_distance_calibrator(
-        self,
-        probabilities: list[float],
+        weights = [max(0.0, float(value)) for value in self.model_weights[: len(per_model)]]
+        if len(weights) != len(per_model) or sum(weights) <= 0.0:
+            weights = [1.0 for _ in per_model]
+        total_weight = sum(weights)
+
+        scores: list[float] = []
+        for row_index in range(len(rows)):
+            value = sum(
+                weight * model_scores[row_index]
+                for weight, model_scores in zip(weights, per_model)
+            ) / total_weight
+            scores.append(self._clamp01(value))
+        return scores
+
+    def _apply_calibrator(self, scores: list[float]) -> list[float]:
+        if not scores or self.calibrator is None:
+            return [self._clamp01(value) for value in scores]
+        if hasattr(self.calibrator, "predict_proba"):
+            calibrated = self.calibrator.predict_proba([[float(value)] for value in scores])
+            return [self._clamp01(row[1]) for row in calibrated]
+        if hasattr(self.calibrator, "transform"):
+            return [self._clamp01(value) for value in self.calibrator.transform(scores)]
+        return [self._clamp01(value) for value in scores]
+
+    @staticmethod
+    def _distance_values(
         rows: list[list[float]],
+        center_key: str,
+        scale_key: str,
+        calibration: dict[str, Any],
     ) -> list[float]:
-        calibrator = self.feature_distance_calibrator
-        if not probabilities or not rows or not calibrator:
-            return [self._clamp01(value) for value in probabilities]
+        if not rows or not calibration:
+            return []
         try:
-            blend = min(max(float(calibrator.get("blend", 0.0)), 0.0), 1.0)
-            means = [float(value) for value in calibrator["means"]]
-            scales = [float(value) for value in calibrator["scales"]]
-            human_centroid = [float(value) for value in calibrator["human_centroid"]]
-            bot_centroid = [float(value) for value in calibrator["bot_centroid"]]
-            weights = [float(value) for value in calibrator["weights"]]
-            temperature = max(float(calibrator.get("temperature", 1.0)), 1e-6)
-        except (KeyError, TypeError, ValueError):
-            return [self._clamp01(value) for value in probabilities]
-        if blend <= 0.0 or not means or len(rows[0]) != len(means):
-            return [self._clamp01(value) for value in probabilities]
-        distance_scores: list[float] = []
-        for row in rows:
-            standardized = [
-                (float(value) - mean) / (scale if abs(scale) >= 1e-6 else 1.0)
-                for value, mean, scale in zip(row, means, scales)
-            ]
-            human_distance = math.sqrt(
-                sum(
-                    weight * (value - center) * (value - center)
-                    for value, center, weight in zip(standardized, human_centroid, weights)
-                )
-                / max(len(standardized), 1)
-            )
-            bot_distance = math.sqrt(
-                sum(
-                    weight * (value - center) * (value - center)
-                    for value, center, weight in zip(standardized, bot_centroid, weights)
-                )
-                / max(len(standardized), 1)
-            )
-            logit = max(min((human_distance - bot_distance) / temperature, 20.0), -20.0)
-            distance_scores.append(self._clamp01(1.0 / (1.0 + math.exp(-logit))))
-        return [
-            self._clamp01((1.0 - blend) * float(probability) + blend * distance_score)
-            for probability, distance_score in zip(probabilities, distance_scores)
-        ]
-
-    def _apply_supervised_score_remap(self, probabilities: list[float]) -> list[float]:
-        expanded = self._apply_supervised_score_expansion(probabilities)
-        if not expanded or not self.score_remap:
-            return [self._clamp01(value) for value in expanded]
-
-        threshold = float(self.score_remap.get("threshold", 0.5))
-        threshold = min(max(threshold, 1e-6), 1.0 - 1e-6)
-        adjusted: list[float] = []
-        for value in expanded:
-            score = self._clamp01(value)
-            if score <= threshold:
-                mapped = 0.5 * score / threshold
-            else:
-                mapped = 0.5 + 0.5 * (score - threshold) / (1.0 - threshold)
-            adjusted.append(self._clamp01(mapped))
-        return adjusted
-
-    def _apply_supervised_score_expansion(self, probabilities: list[float]) -> list[float]:
-        if not probabilities or not self.score_expansion:
-            return [self._clamp01(value) for value in probabilities]
-        try:
-            low = float(self.score_expansion.get("low", 0.0))
-            high = float(self.score_expansion.get("high", 1.0))
+            center = [float(value) for value in calibration.get(center_key) or []]
+            scale = [max(float(value), 1e-6) for value in calibration.get(scale_key) or []]
         except (TypeError, ValueError):
-            return [self._clamp01(value) for value in probabilities]
-        if high <= low + 1e-9:
-            return [self._clamp01(value) for value in probabilities]
-        return [
-            self._clamp01((float(value) - low) / (high - low))
-            for value in probabilities
-        ]
+            return []
+        if not center or len(center) != len(scale):
+            return []
+        distances: list[float] = []
+        for row in rows:
+            if len(row) != len(center):
+                return []
+            z_values = [
+                min(abs((float(value) - base) / denom), 12.0)
+                for value, base, denom in zip(row, center, scale)
+            ]
+            distances.append(sum(z_values) / max(len(z_values), 1))
+        return distances
+
+    def _apply_feature_distance_calibration(
+        self,
+        rows: list[list[float]],
+        scores: list[float],
+    ) -> list[float]:
+        if not scores or not self.feature_distance_calibration:
+            return [self._clamp01(value) for value in scores]
+        if (
+            self.feature_distance_calibration.get("kind")
+            != "feature_distance_after_logistic_v1"
+        ):
+            return [self._clamp01(value) for value in scores]
+        human_distances = self._distance_values(
+            rows,
+            "human_center",
+            "human_scale",
+            self.feature_distance_calibration,
+        )
+        bot_distances = self._distance_values(
+            rows,
+            "bot_center",
+            "bot_scale",
+            self.feature_distance_calibration,
+        )
+        if len(human_distances) != len(scores) or len(bot_distances) != len(scores):
+            return [self._clamp01(value) for value in scores]
+        try:
+            strength = min(
+                max(float(self.feature_distance_calibration.get("strength", 0.0)), 0.0),
+                0.5,
+            )
+            max_shift = min(
+                max(float(self.feature_distance_calibration.get("max_shift", 0.0)), 0.0),
+                0.10,
+            )
+            margin_scale = max(
+                float(self.feature_distance_calibration.get("margin_scale", 0.25)),
+                1e-6,
+            )
+        except (TypeError, ValueError):
+            return [self._clamp01(value) for value in scores]
+
+        calibrated: list[float] = []
+        for value, human_distance, bot_distance in zip(scores, human_distances, bot_distances):
+            score = self._clamp01(value)
+            signed_margin = (float(human_distance) - float(bot_distance)) / margin_scale
+            shift = max_shift * math.tanh(strength * signed_margin)
+            calibrated.append(self._clamp01(score + shift))
+        return calibrated
+
+    def _apply_human_guard(self, scores: list[float]) -> list[float]:
+        if not scores or not self.human_guard:
+            return [self._clamp01(value) for value in scores]
+        try:
+            anchor = float(self.human_guard.get("anchor", 0.0))
+            softness = max(float(self.human_guard.get("softness", 1.0)), 1e-6)
+            strength = min(max(float(self.human_guard.get("strength", 0.0)), 0.0), 1.0)
+        except (TypeError, ValueError):
+            return [self._clamp01(value) for value in scores]
+        if strength <= 0.0:
+            return [self._clamp01(value) for value in scores]
+
+        guarded: list[float] = []
+        for value in scores:
+            score = self._clamp01(value)
+            human_like = 1.0 / (1.0 + math.exp((score - anchor) / softness))
+            guarded.append(self._clamp01(score * (1.0 - strength * human_like)))
+        return guarded
 
     def predict_chunk_scores(self, chunks: list[list[dict[str, Any]]]) -> list[float]:
         if not chunks:
             return []
         rows = self._aligned_rows(chunks)
-        if self.task_type == "human-baseline" and hasattr(self.models[0], "score_samples"):
-            raw_scores = self.models[0].score_samples(rows)
-            anomalies = [-float(value) for value in raw_scores]
-            return [self._risk_from_anomaly(score) for score in anomalies]
-        return self._predict_supervised_scores(rows)
+        raw_scores = self._raw_model_scores(rows)
+        calibrated_scores = self._apply_calibrator(raw_scores)
+        distance_scores = self._apply_feature_distance_calibration(rows, calibrated_scores)
+        guarded_scores = self._apply_human_guard(distance_scores)
+        return [round(self._clamp01(value), 6) for value in guarded_scores]
 
     def predict_chunk_score(self, chunk: list[dict[str, Any]]) -> float:
         scores = self.predict_chunk_scores([chunk])
         return scores[0] if scores else 0.5
+
+    def debug_score_components(
+        self,
+        chunks: list[list[dict[str, Any]]],
+    ) -> dict[str, list[float]]:
+        if not chunks:
+            return {}
+        rows = self._aligned_rows(chunks)
+        raw_scores = self._raw_model_scores(rows)
+        calibrated_scores = self._apply_calibrator(raw_scores)
+        distance_scores = self._apply_feature_distance_calibration(rows, calibrated_scores)
+        final_scores = self._apply_human_guard(distance_scores)
+        components = {
+            "raw_scores": [round(value, 6) for value in raw_scores],
+            "calibrated_scores": [round(value, 6) for value in calibrated_scores],
+            "final_scores": [round(value, 6) for value in final_scores],
+        }
+        if self.feature_distance_calibration:
+            components["feature_distance_scores"] = [
+                round(value, 6) for value in distance_scores
+            ]
+            components["human_distance"] = [
+                round(value, 6)
+                for value in self._distance_values(
+                    rows,
+                    "human_center",
+                    "human_scale",
+                    self.feature_distance_calibration,
+                )
+            ]
+            components["bot_distance"] = [
+                round(value, 6)
+                for value in self._distance_values(
+                    rows,
+                    "bot_center",
+                    "bot_scale",
+                    self.feature_distance_calibration,
+                )
+            ]
+        return components
 
     def benchmark_latency(
         self,
@@ -286,8 +255,7 @@ class Poker44Model:
     ) -> dict[str, float]:
         if not chunks:
             return {"latency_per_chunk_ms": 0.0, "total_latency_ms": 0.0}
-
-        repeats = max(1, repeats)
+        repeats = max(1, int(repeats))
         started = time.perf_counter()
         for _ in range(repeats):
             self.predict_chunk_scores(chunks)

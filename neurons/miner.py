@@ -69,6 +69,14 @@ class Miner(BaseMinerNeuron):
             os.getenv("POKER44_LOG_QUERY_PREVIEW", "0").strip().lower()
             in {"1", "true", "yes", "on"}
         )
+        self.component_debug_logging = (
+            os.getenv("POKER44_LOG_SCORE_COMPONENTS", "1").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.score_array_logging = (
+            os.getenv("POKER44_LOG_SCORE_ARRAYS", "1").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
         self.batch_score_normalization = (
             os.getenv("POKER44_BATCH_SCORE_NORMALIZATION", "0").strip().lower()
             in {"1", "true", "yes", "on"}
@@ -121,6 +129,8 @@ class Miner(BaseMinerNeuron):
         feature_distance_calibrator = model_metadata.get("feature_distance_calibrator") or {}
         score_expansion = model_metadata.get("score_expansion") or {}
         score_remap = model_metadata.get("score_remap") or {}
+        score_logit_bias = model_metadata.get("score_logit_bias")
+        score_logit_temperature = model_metadata.get("score_logit_temperature")
         trained_with_aux_humans = aux_human_rows > 0 or aux_human_calibration_rows > 0
         supervised_notes = (
             "Supervised benchmark model trained on released evaluation chunks"
@@ -145,6 +155,11 @@ class Miner(BaseMinerNeuron):
             supervised_notes += (
                 f"; score_remap={score_remap.get('kind', 'enabled')} "
                 f"threshold={score_remap.get('threshold', 'unknown')}"
+            )
+        if score_logit_bias is not None:
+            supervised_notes += (
+                f"; score_logit_bias={score_logit_bias}"
+                f", score_logit_temperature={score_logit_temperature or 1.0}"
             )
         training_data_statement = (
             f"Trained on {benchmark_rows or 'released'} benchmark chunks with groundTruth labels."
@@ -178,7 +193,7 @@ class Miner(BaseMinerNeuron):
                     else "poker44-reference-heuristic"
                 ),
                 "model_version": (
-                    "human-baseline-v6"
+                    "human-baseline-logit-bias-v2"
                     if trained_with_aux_humans
                     else ("1" if self.predictor is not None else "2")
                 ),
@@ -200,7 +215,8 @@ class Miner(BaseMinerNeuron):
                 "training_data_statement": training_data_statement,
                 "training_data_sources": training_data_sources,
                 "private_data_attestation": (
-                    "No validator-private data used. Supervised artifacts use released benchmark labels"
+                    "No validator-private data used. Supervised artifacts use "
+                    "released benchmark labels"
                     " and, when present, local human-only baseline hands."
                 ),
             },
@@ -300,6 +316,8 @@ class Miner(BaseMinerNeuron):
             "Runtime config | "
             f"max_hands_per_chunk_eval={self.max_hands_per_chunk_eval} "
             f"query_log_preview={self.query_log_preview} "
+            f"component_debug_logging={self.component_debug_logging} "
+            f"score_array_logging={self.score_array_logging} "
             f"batch_score_normalization={self.batch_score_normalization} "
             f"batch_normalization_min_chunks={self.batch_normalization_min_chunks} "
             f"batch_normalization_min_spread={self.batch_normalization_min_spread}"
@@ -488,12 +506,19 @@ class Miner(BaseMinerNeuron):
 
         started = time.perf_counter()
         backend_used = self.backend
+        component_debug = {}
         if self.predictor is not None:
             try:
                 scores = self.predictor.predict_chunk_scores(chunks)
+                if self.component_debug_logging and hasattr(
+                    self.predictor,
+                    "debug_score_components",
+                ):
+                    component_debug = self.predictor.debug_score_components(chunks)
             except Exception as err:
                 bt.logging.warning(
-                    f"Predictor failure during chunk scoring: {err}. Falling back to heuristic backend."
+                    f"Predictor failure during chunk scoring: {err}. "
+                    "Falling back to heuristic backend."
                 )
                 backend_used = "heuristic-fallback"
                 scores = [self.score_chunk(chunk) for chunk in chunks]
@@ -524,7 +549,23 @@ class Miner(BaseMinerNeuron):
                 f" score_preview={scores[:5]} "
                 f"prediction_preview={synapse.predictions[:5]}"
             )
+        if component_debug:
+            for name, values in component_debug.items():
+                if values:
+                    message += f" {name}_range={[min(values), max(values)]}"
         bt.logging.info(message)
+        if self.score_array_logging:
+            score_payload = {
+                "chunk_sizes": chunk_sizes,
+                "risk_scores": [round(float(score), 6) for score in scores],
+                "predictions": [bool(prediction) for prediction in synapse.predictions],
+            }
+            if component_debug:
+                score_payload["components"] = {
+                    name: [round(float(value), 6) for value in values]
+                    for name, values in component_debug.items()
+                }
+            bt.logging.info(f"Detailed chunk scores | {score_payload}")
         bt.logging.success(
             "Validator response sent successfully | "
             f"caller={caller} "

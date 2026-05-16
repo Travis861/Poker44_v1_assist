@@ -10,13 +10,11 @@ from poker44_ml.features import chunk_features
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_BENCHMARK_PATH = (
+    REPO_ROOT / "hands_generator" / "evaluation_datas" / "training_benchmark.txt"
+)
 DEFAULT_HUMAN_PATH = (
     REPO_ROOT / "hands_generator" / "human_hands" / "poker_hands_combined.json.gz"
-)
-DEFAULT_BENCHMARK_DIR = REPO_ROOT / "hands_generator" / "evaluation_datas"
-DEFAULT_BENCHMARK_PATTERNS = (
-    "training_benchmark.txt",
-    "training_benchmark_*.txt",
 )
 
 
@@ -27,201 +25,166 @@ def load_json_or_gz(path: str | Path) -> Any:
         return json.load(handle)
 
 
-def resolve_human_path(preferred: str | Path | None) -> Path:
-    candidates = [Path(preferred)] if preferred else []
-    candidates.append(DEFAULT_HUMAN_PATH)
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    joined = ", ".join(str(path) for path in candidates)
-    raise FileNotFoundError(f"None of the candidate human corpus paths exist: {joined}")
-
-
-def resolve_benchmark_paths(preferred: str | Path | None) -> list[Path]:
-    if preferred:
-        candidate = Path(preferred)
+def resolve_benchmark_paths(path: str | Path | None) -> list[Path]:
+    if path:
+        candidate = Path(path)
         if candidate.is_dir():
-            paths = []
-            for pattern in DEFAULT_BENCHMARK_PATTERNS:
-                paths.extend(sorted(candidate.glob(pattern)))
+            paths = sorted(candidate.glob("training_benchmark*.txt"))
         else:
-            paths = [candidate] if candidate.exists() else []
+            paths = [candidate]
     else:
-        paths = []
-        for pattern in DEFAULT_BENCHMARK_PATTERNS:
-            paths.extend(sorted(DEFAULT_BENCHMARK_DIR.glob(pattern)))
-
-    existing = sorted({path for path in paths if path.exists()})
-    if existing:
-        return existing
-
-    target = str(preferred) if preferred else ", ".join(
-        str(DEFAULT_BENCHMARK_DIR / pattern)
-        for pattern in DEFAULT_BENCHMARK_PATTERNS
-    )
-    raise FileNotFoundError(f"No benchmark files found for: {target}")
+        paths = [DEFAULT_BENCHMARK_PATH]
+    existing = [candidate for candidate in paths if candidate.exists()]
+    if not existing:
+        raise FileNotFoundError(f"No benchmark files found for {path or DEFAULT_BENCHMARK_PATH}")
+    return existing
 
 
-def _chunk_row(chunk: list[dict[str, Any]]) -> dict[str, float]:
-    features = chunk_features(chunk)
-    features["hand_count"] = float(len(chunk))
-    return features
+def resolve_human_path(path: str | Path | None) -> Path:
+    candidate = Path(path) if path else DEFAULT_HUMAN_PATH
+    if not candidate.exists():
+        raise FileNotFoundError(f"Human baseline file not found: {candidate}")
+    return candidate
 
 
-def _benchmark_examples_from_file(path: str | Path) -> list[dict[str, Any]]:
+def _as_root(payload: Any) -> Any:
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        return payload["data"]
+    return payload
+
+
+def _feature_row(chunk: list[dict[str, Any]]) -> dict[str, float]:
+    row = chunk_features(chunk)
+    row["hand_count"] = float(len(chunk))
+    return row
+
+
+def _iter_release_groups(payload: Any) -> list[dict[str, Any]]:
+    root = _as_root(payload)
+    if isinstance(root, dict) and isinstance(root.get("chunks"), list):
+        return [group for group in root["chunks"] if isinstance(group, dict)]
+    return []
+
+
+def _load_labeled_benchmark_file(path: Path) -> list[dict[str, Any]]:
     payload = load_json_or_gz(path)
-    root = payload.get("data") if isinstance(payload, dict) else None
-    root = root if isinstance(root, dict) else payload
-    groups = root.get("chunks") if isinstance(root, dict) else None
-    if not isinstance(groups, list):
-        raise RuntimeError(f"Benchmark payload is missing a top-level chunks list: {path}")
+    root = _as_root(payload)
+    groups = _iter_release_groups(payload)
+    if not groups:
+        raise RuntimeError(f"Benchmark file has no labeled chunk groups: {path}")
 
-    source_path = str(Path(path))
     examples: list[dict[str, Any]] = []
     for group_index, group in enumerate(groups):
-        if not isinstance(group, dict):
-            continue
-        chunk_list = group.get("chunks") or []
-        labels = group.get("groundTruth") or []
-        if len(chunk_list) != len(labels):
+        chunks = group.get("chunks") or []
+        labels = group.get("groundTruth") or group.get("groundTruthLabels") or []
+        if len(chunks) != len(labels):
             raise RuntimeError(
-                f"Benchmark group {group.get('chunkId', group_index)} has mismatched "
-                f"chunks ({len(chunk_list)}) and groundTruth ({len(labels)}) in {path}."
+                f"Benchmark group {group_index} has {len(chunks)} chunks but "
+                f"{len(labels)} labels in {path}"
             )
         source_date = str(group.get("sourceDate") or root.get("sourceDate") or "")
         group_id = str(group.get("chunkId") or f"group_{group_index}")
         group_hash = str(group.get("chunkHash") or "")
-        for item_index, (chunk, label) in enumerate(zip(chunk_list, labels)):
+        for item_index, (chunk, label) in enumerate(zip(chunks, labels)):
             if not isinstance(chunk, list):
+                continue
+            hand_chunk = [hand for hand in chunk if isinstance(hand, dict)]
+            if not hand_chunk:
                 continue
             examples.append(
                 {
-                    "chunk": list(chunk),
+                    "chunk": hand_chunk,
                     "label": int(label),
                     "source_date": source_date,
                     "group_id": group_id,
                     "group_hash": group_hash,
                     "item_index": item_index,
-                    "source_path": source_path,
-                    "features": _chunk_row(list(chunk)),
+                    "source_path": str(path),
+                    "features": _feature_row(hand_chunk),
                 }
             )
+    if not examples:
+        raise RuntimeError(f"No usable labeled chunks found in {path}")
     return examples
 
 
 def load_benchmark_examples(paths: str | Path | list[str | Path]) -> list[dict[str, Any]]:
-    if isinstance(paths, (str, Path)):
-        path_list = [Path(paths)]
-    else:
-        path_list = [Path(path) for path in paths]
-
+    path_list = [Path(paths)] if isinstance(paths, (str, Path)) else [Path(p) for p in paths]
     examples: list[dict[str, Any]] = []
-    seen_keys: set[str] = set()
+    seen: set[str] = set()
     for path in path_list:
-        for example in _benchmark_examples_from_file(path):
-            dedupe_key = "|".join(
+        for example in _load_labeled_benchmark_file(path):
+            key = "|".join(
                 [
-                    example.get("group_hash", ""),
-                    example.get("group_id", ""),
+                    str(example.get("source_path", "")),
+                    str(example.get("group_hash", "")),
+                    str(example.get("group_id", "")),
                     str(example.get("item_index", "")),
                 ]
             )
-            if dedupe_key in {"||", ""}:
-                dedupe_key = f"{example.get('source_path', '')}|{example.get('group_id', '')}|{example.get('item_index', '')}"
-            if dedupe_key in seen_keys:
+            if key in seen:
                 continue
-            seen_keys.add(dedupe_key)
+            seen.add(key)
             examples.append(example)
     if not examples:
-        raise RuntimeError("No benchmark chunk examples were found in the selected files.")
+        raise RuntimeError("No benchmark examples loaded.")
     return examples
 
 
-def build_human_chunk_rows(
-    human_hands: list[dict[str, Any]],
-    *,
-    chunk_size: int = 80,
-    min_chunk_size: int | None = None,
-    stride: int | None = None,
-    repeats: int = 1,
-    seed: int = 42,
-    shuffle: bool = False,
-) -> list[dict[str, float]]:
-    minimum = min_chunk_size if min_chunk_size is not None else max(20, chunk_size // 2)
-    stride = stride if stride is not None else max(1, chunk_size // 2)
-    rows: list[dict[str, float]] = []
-    hands = list(human_hands)
+def load_human_hands(path: str | Path) -> list[dict[str, Any]]:
+    payload = load_json_or_gz(path)
+    root = _as_root(payload)
+    if isinstance(root, list):
+        return [hand for hand in root if isinstance(hand, dict)]
 
-    if shuffle:
-        random.Random(seed).shuffle(hands)
-
-    phase_count = max(1, repeats)
-    phase_step = max(1, stride // phase_count)
-    seen_offsets: set[int] = set()
-
-    for repeat_index in range(phase_count):
-        if shuffle and repeat_index:
-            random.Random(seed + repeat_index).shuffle(hands)
-            start_offset = 0
-        else:
-            start_offset = min(stride - 1, repeat_index * phase_step)
-        if start_offset in seen_offsets and not shuffle:
-            continue
-        seen_offsets.add(start_offset)
-        for start_index in range(start_offset, len(hands), stride):
-            chunk = hands[start_index : start_index + chunk_size]
-            if len(chunk) < minimum:
+    hands: list[dict[str, Any]] = []
+    for group in _iter_release_groups(payload):
+        for chunk in group.get("chunks") or []:
+            if not isinstance(chunk, list):
                 continue
-            rows.append(_chunk_row(chunk))
-    return rows
+            hands.extend(hand for hand in chunk if isinstance(hand, dict))
+    if not hands:
+        raise RuntimeError(f"No human hands found in {path}")
+    return hands
 
 
 def build_human_chunk_examples(
     human_hands: list[dict[str, Any]],
     *,
-    chunk_size: int = 80,
-    min_chunk_size: int | None = None,
-    stride: int | None = None,
-    repeats: int = 1,
+    chunk_sizes: list[int],
+    count: int,
+    min_chunk_size: int = 20,
     seed: int = 42,
-    shuffle: bool = False,
     source_path: str = "",
 ) -> list[dict[str, Any]]:
-    minimum = min_chunk_size if min_chunk_size is not None else max(20, chunk_size // 2)
-    stride = stride if stride is not None else max(1, chunk_size // 2)
-    hands = list(human_hands)
+    if not human_hands or count <= 0:
+        return []
+    sizes = [max(min_chunk_size, int(size)) for size in chunk_sizes if int(size) > 0]
+    if not sizes:
+        sizes = [80]
+
+    rng = random.Random(seed)
     examples: list[dict[str, Any]] = []
-
-    if shuffle:
-        random.Random(seed).shuffle(hands)
-
-    phase_count = max(1, repeats)
-    phase_step = max(1, stride // phase_count)
-    seen_offsets: set[int] = set()
-
-    for repeat_index in range(phase_count):
-        if shuffle and repeat_index:
-            random.Random(seed + repeat_index).shuffle(hands)
-            start_offset = 0
+    max_start = max(0, len(human_hands) - min(sizes))
+    for item_index in range(count):
+        size = rng.choice(sizes)
+        if len(human_hands) <= size:
+            chunk = list(human_hands)
         else:
-            start_offset = min(stride - 1, repeat_index * phase_step)
-        if start_offset in seen_offsets and not shuffle:
+            start = rng.randint(0, max(0, min(max_start, len(human_hands) - size)))
+            chunk = list(human_hands[start : start + size])
+        if len(chunk) < min_chunk_size:
             continue
-        seen_offsets.add(start_offset)
-        for item_index, start_index in enumerate(range(start_offset, len(hands), stride)):
-            chunk = hands[start_index : start_index + chunk_size]
-            if len(chunk) < minimum:
-                continue
-            examples.append(
-                {
-                    "chunk": list(chunk),
-                    "label": 0,
-                    "source_date": "aux_human",
-                    "group_id": f"aux_human_{repeat_index}",
-                    "group_hash": "",
-                    "item_index": item_index,
-                    "source_path": source_path,
-                    "features": _chunk_row(chunk),
-                }
-            )
+        examples.append(
+            {
+                "chunk": chunk,
+                "label": 0,
+                "source_date": "human_baseline",
+                "group_id": "human_baseline",
+                "group_hash": "",
+                "item_index": item_index,
+                "source_path": source_path,
+                "features": _feature_row(chunk),
+            }
+        )
     return examples
